@@ -1,0 +1,349 @@
+/*
+ * Copyright 2020 the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.gradle.internal.cc.impl.problems
+
+import com.google.common.collect.Comparators
+import com.google.common.collect.ImmutableList
+import com.google.common.collect.ImmutableMap
+import org.gradle.api.internal.DocumentationRegistry
+import org.gradle.internal.configuration.problems.DocumentationSection
+import org.gradle.internal.configuration.problems.PropertyProblem
+import org.gradle.internal.extensions.stdlib.capitalized
+import org.gradle.internal.logging.ConsoleRenderer
+import java.io.File
+import java.util.Comparator.comparing
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+
+
+private
+const val MAX_CONSOLE_PROBLEMS = 15
+
+
+private
+const val MAX_PROBLEM_EXCEPTIONS = 5
+
+/**
+ * This class is thread-safe.
+ */
+internal
+class ConfigurationCacheProblemsSummary(
+
+    private
+    val maxCollectedProblems: Int = 4096
+
+) {
+    /**
+     * Reported more problems than can be collected.
+     */
+    private
+    var overflowed: Boolean = false
+
+    private
+    var totalProblemCount: Int = 0
+
+    private
+    var deferredProblemCount: Int = 0
+
+    private
+    var suppressedProblemCount: Int = 0
+
+    private
+    var suppressedSilentlyProblemCount: Int = 0
+
+    private
+    var incompatibleTasksCount: Int = 0
+
+    private
+    var incompatibleFeatureCount: Int = 0
+
+    /**
+     * Unique problem causes observed among all reported problems.
+     *
+     * We also track severity per cause to provide useful ordering of problems when reporting the summary.
+     */
+    private
+    val problemCauses = HashMap<ProblemCause, ProblemSeverity>()
+
+    /**
+     * As some problems come with original exceptions attached,
+     * we collect a small number of them to include as part of the build failure
+     */
+    private
+    val originalProblemExceptions = ArrayList<Throwable>(MAX_PROBLEM_EXCEPTIONS)
+
+    private
+    val severityComparator = consoleComparatorForSeverity()
+
+    private
+    val lock = ReentrantLock()
+
+    fun get(): Summary = lock.withLock {
+        Summary(
+            totalProblemCount,
+            deferredProblemCount,
+            suppressedSilentlyProblemCount,
+            ImmutableMap.copyOf(problemCauses),
+            ImmutableList.copyOf(originalProblemExceptions),
+            overflowed,
+            maxCollectedProblems,
+            incompatibleTasksCount,
+            incompatibleFeatureCount
+        )
+    }
+
+    /**
+     * Returns`true` if the problem was accepted, `false` if it was rejected because the maximum number of problems was reached.
+     */
+    fun onProblem(problem: PropertyProblem, severity: ProblemSeverity): Boolean {
+        lock.withLock {
+            totalProblemCount += 1
+            when (severity) {
+                ProblemSeverity.Deferred -> deferredProblemCount += 1
+                ProblemSeverity.Suppressed -> suppressedProblemCount += 1
+                ProblemSeverity.SuppressedSilently -> suppressedSilentlyProblemCount += 1
+                ProblemSeverity.Interrupting -> {}
+            }
+            if (overflowed) {
+                return false
+            }
+            if (totalProblemCount > maxCollectedProblems) {
+                overflowed = true
+                return false
+            }
+            if (severity != ProblemSeverity.SuppressedSilently) {
+                val isNewCause = recordProblemCause(problem, severity)
+                if (isNewCause && severity != ProblemSeverity.Interrupting) {
+                    collectOriginalException(problem)
+                }
+            }
+            return true
+        }
+    }
+
+    fun onIncompatibleTask() {
+        lock.withLock {
+            incompatibleTasksCount += 1
+        }
+    }
+
+    fun onIncompatibleFeature() {
+        lock.withLock {
+            incompatibleFeatureCount += 1
+        }
+    }
+
+    private
+    fun collectOriginalException(problem: PropertyProblem) {
+        if (originalProblemExceptions.size < MAX_PROBLEM_EXCEPTIONS) {
+            problem.exception?.let {
+                originalProblemExceptions.add(it)
+            }
+        }
+    }
+
+    /**
+     * Returns true if problems with the same cause have not been seen before.
+     */
+    private
+    fun recordProblemCause(problem: PropertyProblem, severity: ProblemSeverity): Boolean {
+        val cause = ProblemCause.of(problem)
+        val isNew = !problemCauses.containsKey(cause)
+        problemCauses.merge(cause, severity) { old, new ->
+            if (severityComparator.compare(old, new) < 0) old else new
+        }
+        return isNew
+    }
+}
+
+
+internal
+class Summary(
+    /**
+     * Total of all problems, regardless of severity.
+     */
+    val totalProblemCount: Int,
+
+    /**
+     * Number of [deferred][ProblemSeverity.Deferred] failures.
+     */
+    val deferredProblemCount: Int,
+
+    /**
+     * Number of problems which shouldn't be reported in the console.
+     */
+    private
+    val suppressedSilentlyProblemCount: Int,
+
+    private
+    val reportableProblemCauses: Map<ProblemCause, ProblemSeverity>,
+
+    val originalProblemExceptions: List<Throwable>,
+
+    private
+    val overflowed: Boolean,
+
+    private
+    val maxCollectedProblems: Int,
+
+    /**
+     * Total number of tasks in the current work graph that are not CC-compatible.
+     */
+    private
+    val incompatibleTasksCount: Int,
+    /**
+     * Total number of features that are not CC-compatible.
+     */
+    private
+    val incompatibleFeatureCount: Int
+) {
+    val reportableProblemCount: Int
+        get() = totalProblemCount - suppressedSilentlyProblemCount
+
+    val reportableProblemCauseCount: Int
+        get() = reportableProblemCauses.size
+
+    fun textForConsole(cacheActionText: String, htmlReportFile: File? = null): String {
+        val documentationRegistry = DocumentationRegistry()
+        return StringBuilder().apply {
+            // When build degrades gracefully, we keep the console output minimal but still want to see the report link
+            val hasReportableProblems = reportableProblemCount > 0
+            if (hasReportableProblems) {
+                appendLine()
+                appendSummaryHeader(cacheActionText, reportableProblemCount)
+                appendLine()
+                topProblemsForConsole().forEach { problem ->
+                    append("- ")
+                    append(problem.userCodeLocation.capitalized())
+                    append(": ")
+                    appendLine(problem.message)
+                    problem.documentationSection?.let {
+                        appendLine("  See ${documentationRegistry.getDocumentationFor(it.page, it.anchor)}")
+                    }
+                }
+                if (reportableProblemCauseCount > MAX_CONSOLE_PROBLEMS) {
+                    appendLine("plus ${reportableProblemCauseCount - MAX_CONSOLE_PROBLEMS} more problems. Please see the report for details.")
+                }
+            }
+            val hasIncompatibleTasks = incompatibleTasksCount > 0
+            val hasIncompatibleFeatures = incompatibleFeatureCount > 0
+            htmlReportFile?.let {
+                appendLine()
+                if ((hasIncompatibleTasks || hasIncompatibleFeatures) && !hasReportableProblems) {
+                    // Some tests parse this line, you may need to change them if you change the message.
+                    append("Some tasks or features in this build are not compatible with the configuration cache.")
+                    appendLine()
+                }
+                append(buildSummaryReportLink(it))
+            }
+        }.toString()
+    }
+
+    private
+    fun topProblemsForConsole(): Sequence<ProblemCause> =
+        reportableProblemCauses.entries.stream()
+            .collect(Comparators.least(MAX_CONSOLE_PROBLEMS, consoleComparatorForProblemCauseWithSeverity()))
+            .asSequence()
+            .map { it.key }
+
+    private
+    fun StringBuilder.appendSummaryHeader(
+        cacheAction: String,
+        reportableProblemCount: Int
+    ) {
+        // Some tests parse this header.
+        append(reportableProblemCount)
+        append(if (reportableProblemCount == 1) " problem was found " else " problems were found ")
+        append(cacheAction)
+        append(" the configuration cache")
+        if (overflowed) {
+            append(", only the first ")
+            append(maxCollectedProblems)
+            append(" were considered")
+        }
+        if (reportableProblemCount != reportableProblemCauseCount) {
+            append(", ")
+            append(reportableProblemCauseCount)
+            append(" of which ")
+            append(if (reportableProblemCauseCount == 1) "seems unique" else "seem unique")
+        }
+        append(".")
+    }
+
+    private
+    fun buildSummaryReportLink(reportFile: File) =
+        "See the complete report at ${clickableUrlFor(reportFile)}"
+
+    private
+    fun clickableUrlFor(file: File) =
+        ConsoleRenderer().asClickableFileUrl(file)
+}
+
+
+private
+fun consoleComparatorForProblemCauseWithSeverity(): Comparator<Map.Entry<ProblemCause, ProblemSeverity>> =
+    comparing<Map.Entry<ProblemCause, ProblemSeverity>, ProblemSeverity>({ it.value }, consoleComparatorForSeverity())
+        .thenComparing({ it.key }, consoleComparatorForProblemCause())
+
+
+private
+fun consoleComparatorForProblemCause(): Comparator<ProblemCause> =
+    comparing { p: ProblemCause -> p.userCodeLocation }
+        .thenComparing { p: ProblemCause -> p.message }
+
+
+/**
+ * Sorts the severities in the order suitable for a console summary.
+ *
+ * Deferred problems go first because their presence is the cause of the Configuration Cache build failure.
+ * Suppressed problems are included, but their presence alone would not have triggered a build failure.
+ * Interrupting problems will have a dedicated build failure, so they have the low summary priority.
+ * Suppressed silently problems will not be printed in the console and have the lowest possible priority.
+ */
+private
+fun consoleComparatorForSeverity(): Comparator<ProblemSeverity> =
+    Comparator.comparingInt { it: ProblemSeverity ->
+        when (it) {
+            ProblemSeverity.Deferred -> 1
+            ProblemSeverity.Suppressed -> 2
+            ProblemSeverity.Interrupting -> 3
+            ProblemSeverity.SuppressedSilently -> Int.MAX_VALUE
+        }
+    }
+
+
+/**
+ * A subset of [PropertyProblem] information used for summarization of all observed problems.
+ *
+ * For instance, we omit the stacktrace.
+ */
+internal
+data class ProblemCause(
+    val userCodeLocation: String,
+    val message: String,
+    val documentationSection: DocumentationSection?
+) {
+    companion object {
+        fun of(problem: PropertyProblem) = problem.run {
+            ProblemCause(
+                trace.containingUserCode,
+                message.render(),
+                documentationSection
+            )
+        }
+    }
+}

@@ -1,0 +1,220 @@
+// Copyright (C) 2024 Gradle, Inc.
+//
+// Licensed under the Creative Commons Attribution-Noncommercial-ShareAlike 4.0 International License.;
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      https://creativecommons.org/licenses/by-nc-sa/4.0/
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+[[upgrading_version_9]]
+
+= Upgrading your build from Gradle 9.x to the latest
+
+This chapter provides the information you need to migrate your Gradle 9.x builds to the latest Gradle release.
+For migrating from Gradle 4.x, 5.x, 6.x, 7.x, or 8.x see the <<upgrading_version_8.adoc#upgrading_version_8, older migration guide>> first.
+
+We recommend the following steps for all users:
+
+. Try running `gradle help --scan` and view the https://gradle.com/enterprise/releases/2018.4/#identify-usages-of-deprecated-gradle-functionality[deprecations view] of the generated Build Scan.
++
+image::deprecations.png[Deprecations View of a Gradle Build Scan]
++
+This lets you see any deprecation warnings that apply to your build.
++
+Alternatively, you can run `gradle help --warning-mode=all` to see the deprecations in the console, though it may not report as much detailed information.
+. Update your plugins.
++
+Some plugins will break with this new version of Gradle because they use internal APIs that have been removed or changed.
+The previous step will help you identify potential problems by issuing deprecation warnings when a plugin tries to use a deprecated part of the API.
++
+. Run `gradle wrapper --gradle-version {gradleVersion}` to update the project to {gradleVersion}.
+. Try to run the project and debug any errors using the <<troubleshooting.adoc#troubleshooting, Troubleshooting Guide>>.
+
+[[changes_9.1]]
+== Upgrading from 9.0 and earlier
+
+=== Deprecations
+
+[[dependency_multi_string_notation]]
+==== Deprecated multi-string dependency notation
+
+In an effort to simplify and standardize the Gradle API, the multi-string dependency notation has been deprecated and will no longer be permitted in Gradle 10.
+Gradle will primarily accept dependency declarations in the form of a single string, with each dependency coordinate separated by a colon.
+
+Below are examples of the deprecated multi-string notation:
+
+====
+[.multi-language-sample]
+=====
+.build.gradle.kts
+[source,kotlin]
+----
+dependencies {
+    implementation(group = "org", name = "foo", version = "1.0")
+    implementation(group = "org", name = "foo", version = "1.0", configuration = "conf")
+    implementation(group = "org", name = "foo", version = "1.0", classifier = "classifier")
+    implementation(group = "org", name = "foo", version = "1.0", ext = "ext")
+}
+
+testing.suites.named<JvmTestSuite>("test") {
+    dependencies {
+        implementation(module(group = "org", name = "foo", version = "1.0"))
+    }
+}
+----
+=====
+[.multi-language-sample]
+=====
+.build.gradle
+[source,groovy]
+----
+dependencies {
+    implementation(group: 'org', name: 'foo', version: '1.0')
+    implementation(group: 'org', name: 'foo', version: '1.0', configuration: 'conf')
+    implementation(group: 'org', name: 'foo', version: '1.0', classifier: 'classifier')
+    implementation(group: 'org', name: 'foo', version: '1.0', ext: 'ext')
+}
+
+testing.suites.test {
+    dependencies {
+        implementation(module(group: 'org', name: 'foo', version: '1.0'))
+    }
+}
+----
+=====
+====
+
+These declarations should be replaced with the single-string notation:
+
+====
+[.multi-language-sample]
+=====
+.build.gradle.kts
+[source,kotlin]
+----
+dependencies {
+    implementation("org:foo:1.0")
+    implementation("org:foo:1.0") {
+        targetConfiguration = "conf"
+    }
+    implementation("org:foo:1.0:classifier")
+    implementation("org:foo:1.0@ext")
+}
+
+testing.suites.named<JvmTestSuite>("test") {
+    dependencies {
+        implementation("org:foo:1.0")
+    }
+}
+----
+=====
+[.multi-language-sample]
+=====
+.build.gradle
+[source,groovy]
+----
+dependencies {
+    implementation("org:foo:1.0")
+    implementation("org:foo:1.0") {
+        targetConfiguration = "conf"
+    }
+    implementation("org:foo:1.0:classifier")
+    implementation("org:foo:1.0@ext")
+}
+
+testing.suites.test {
+    dependencies {
+        implementation("org:foo:1.0")
+    }
+}
+----
+=====
+====
+
+In some cases, a complete single-string notation may not be known up front.
+Instead of concatenating the coordinates into a new string, it is possible to use a link:{javadocPath}/org/gradle/api/artifacts/dsl/DependencyFactory.html[`DependencyFactory`] to create `Dependency` instances directly from the individual components:
+
+====
+[.multi-language-sample]
+=====
+.build.gradle.kts
+[source,kotlin]
+----
+val group = "org"
+val artifactId = "foo"
+val version = "1.0"
+
+configurations.dependencyScope("implementation") {
+    dependencies.add(project.dependencyFactory.create(group, artifactId, version))
+}
+----
+=====
+[.multi-language-sample]
+=====
+.build.gradle
+[source,groovy]
+----
+def group = "org"
+def artifactId = "foo"
+def version = "1.0"
+
+configurations.dependencyScope("implementation") {
+    dependencies.add(project.dependencyFactory.create(group, artifactId, version))
+}
+----
+=====
+====
+
+[[archives-configuration]]
+==== Deprecation of the `archives` configuration
+The `archives` configuration added by the `base` plugin has been deprecated and will be removed in Gradle 10.0.0.
+Adding artifacts to the `archives` configuration will now result in a deprecation warning.
+If you want the artifact built when running the `assemble` task, you should add the artifact (or the task that produces it) as a dependency of the `assemble` task directly.
+
+.build.gradle.kts
+[source,kotlin]
+----
+val specialJar = tasks.register<Jar>("specialJar") {
+    archiveBaseName.set("special")
+    from("build/special")
+}
+
+tasks.named("assemble") {
+    dependsOn(specialJar)
+}
+----
+
+[[deprecate-visible-property]]
+==== The `Configuration.visible` property is now deprecated
+Prior to Gradle 9.0, any configuration with `isVisible()` returning `true` would have its artifacts built automatically when the `assemble` task was executed.
+This implicit behavior was removed in 9.0.0, and the `Configuration.visible` property no longer has any meaningful effect.
+This property is now deprecated and will be removed in Gradle 10.0.0.
+Any usage of `visible` can be removed.
+If you want the artifacts of a configuration to be built as part of the `assemble` task, add an explicit task dependency on `assemble` instead:
+
+.build.gradle.kts
+[source,kotlin]
+----
+val specialJar = tasks.register<Jar>("specialJar") {
+    archiveBaseName.set("special")
+    from("build/special")
+}
+
+configurations {
+    consumable("special") {
+        outgoing.artifact(specialJar)
+    }
+}
+
+tasks.named("assemble") {
+    dependsOn(specialJar)
+}
+----
+
+=== Potential breaking changes
